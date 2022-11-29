@@ -22,6 +22,7 @@ jobs:
       run: |
         mkdir out
         mkdir ../output
+        sudo apt install fakeroot build-essential bc bison flex libelf-dev libssl-dev xz-utils ncurses-dev
         kernel_ver=$(make O=out kernelversion --no-print-directory)
         make O=out vanilla_defconfig
         echo -e "$(nproc) thread compile"
