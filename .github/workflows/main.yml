@@ -19,7 +19,6 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: docker.io/qctt/kernelbuild:ubuntu20
     
     steps:
     - name: Checkout
@@ -32,3 +31,4 @@ jobs:
         ls
         pwd
         ls ..
+        ls ${{ github.workspace }}
