@@ -20,15 +20,14 @@ jobs:
     - name: Compile the kernel
       id: compile
       run: |
-        sudo apt install fakeroot build-essential bc bison flex libelf-dev libssl-dev xz-utils ncurses-dev rpm
-        mkdir out
+        sudo apt install libelf-dev rpm
         mkdir ../output
-        kernel_ver=$(make O=out kernelversion --no-print-directory)
-        make O=out vanilla_defconfig
+        kernel_ver=$(make kernelversion --no-print-directory)
+        make vanilla_defconfig
         echo -e "$(nproc) thread compile"
-        time make O=out -j$(nproc)
-        time make O=out modules -j$(nproc)
-        time make O=out rpm-pkg -j$(nproc)
+        time make -j$(nproc)
+        time make modules -j$(nproc)
+        time make rpm-pkg -j$(nproc)
         cp -r ~/rpmbuild/RPMS/x86_64/* ../output/
         echo '::set-output name=action_echo::enabled'
         echo "::set-output name=status::success"
@@ -46,7 +45,7 @@ jobs:
     - name: Generate release tag
       id: tag
       run: |
-        kernel_ver=$(make O=out kernelversion --no-print-directory)
+        kernel_ver=$(make kernelversion --no-print-directory)
         echo '::set-output name=action_echo::enabled'
         echo "::set-output name=release_tag::Kernel_Vanilla_${kernel_ver}_$(date +"%Y.%m.%d-%H%M")"
         touch release.txt
