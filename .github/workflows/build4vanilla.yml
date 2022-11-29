@@ -14,18 +14,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-      - uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: fakeroot build-essential bc bison flex libelf-dev libssl-dev xz-utils ncurses-dev rpm
-          version: 1.0
-
     - name: Checkout
       uses: actions/checkout@master
 
     - name: Compile the kernel
       id: compile
       run: |
+        sudo apt install fakeroot build-essential bc bison flex libelf-dev libssl-dev xz-utils ncurses-dev rpm
         mkdir out
         mkdir ../output
         kernel_ver=$(make O=out kernelversion --no-print-directory)
