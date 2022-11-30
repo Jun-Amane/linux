@@ -41,7 +41,7 @@ jobs:
       uses: actions/upload-artifact@master
       with:
         name: ${{ env.FILE_DATE }}
-        path: ~/output
+        path: /output/
 
     - name: Generate release tag
       id: tag
@@ -61,4 +61,4 @@ jobs:
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
-        files: ~/output/*
+        files: /output/*
