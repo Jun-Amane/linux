@@ -27,7 +27,7 @@ jobs:
         kernel_ver=$(make kernelversion --no-print-directory)
         make vanilla_defconfig
         echo -e "$(nproc) thread compile"
-        sudo time make rpm-pkg -j$(nproc)
+        sudo time make INSTALL_MOD_STRIP=1 rpm-pkg -j$(nproc)
         sudo mv /root/rpmbuild/RPMS/x86_64/* /output/
         sudo chmod 777 /output/* -R
         echo '::set-output name=action_echo::enabled'
