@@ -63,4 +63,4 @@ jobs:
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
-        files: /output/*.rpm
+        files: /output/*
