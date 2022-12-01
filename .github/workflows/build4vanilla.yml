@@ -23,11 +23,12 @@ jobs:
       id: compile
       run: |
         sudo apt install libelf-dev rpm
-        sudo mkdir /output
+        sudo mkdir -p /output
         kernel_ver=$(make kernelversion --no-print-directory)
         make vanilla_defconfig
         echo -e "$(nproc) thread compile"
         sudo time make INSTALL_MOD_STRIP=1 rpm-pkg -j$(nproc)
+        sudo find /root/rpmbuild
         sudo mv /root/rpmbuild/RPMS/x86_64/* /output/
         sudo chmod 777 /output/* -R
         echo '::set-output name=action_echo::enabled'
