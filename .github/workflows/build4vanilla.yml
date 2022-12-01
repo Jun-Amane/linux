@@ -29,9 +29,7 @@ jobs:
         make vanilla_defconfig
         echo -e "$(nproc) thread compile"
         sudo time make INSTALL_MOD_STRIP=1 rpm-pkg -j$(nproc)
-        cd /root/rpmbuild/RPMS/x86_64/
-        sudo tar -cvf /output/out.tar *.rpm
-        cd /output
+        sudo cp -r /root/rpmbuild/RPMS/x86_64/*.rpm /output/
         sudo chmod 777 /output/* -R
         echo '::set-output name=action_echo::enabled'
         echo "::set-output name=status::success"
@@ -64,4 +62,4 @@ jobs:
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
-        files: /output/*
+        files: /output/*.rpm
