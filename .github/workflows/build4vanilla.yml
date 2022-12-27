@@ -22,7 +22,7 @@ jobs:
     - name: Compile the kernel
       id: compile
       run: |
-        sudo apt install libelf-dev rpm
+        sudo apt install build-essential libelf-dev rpm bc binutils bison dwarves flex gcc make openssl libssl-dev elfutils perl python3 rsync
         sudo mkdir -p /output
         sudo chmod 777 /output -R
         kernel_ver=$(make kernelversion --no-print-directory)
