@@ -352,7 +352,7 @@ parse_eeprom (struct net_device *dev)
 	eth_hw_addr_set(dev, psrom->mac_addr);
 
 	if (np->chip_id == CHIP_IP1000A) {
-		np->led_mode = psrom->led_mode;
+		np->led_mode = le16_to_cpu(psrom->led_mode);
 		return 0;
 	}
 
@@ -565,8 +565,7 @@ static void rio_hw_init(struct net_device *dev)
 	 * too. However, it doesn't work on IP1000A so we use 16-bit access.
 	 */
 	for (i = 0; i < 3; i++)
-		dw16(StationAddr0 + 2 * i,
-		     cpu_to_le16(((const u16 *)dev->dev_addr)[i]));
+		dw16(StationAddr0 + 2 * i, get_unaligned_le16(&dev->dev_addr[2 * i]));
 
 	set_multicast (dev);
 	if (np->coalesce) {
@@ -1779,7 +1778,7 @@ rio_close (struct net_device *dev)
 	rio_hw_stop(dev);
 
 	free_irq(pdev->irq, dev);
-	del_timer_sync (&np->timer);
+	timer_delete_sync(&np->timer);
 
 	free_list(dev);
 
@@ -1819,7 +1818,7 @@ static int rio_suspend(struct device *device)
 		return 0;
 
 	netif_device_detach(dev);
-	del_timer_sync(&np->timer);
+	timer_delete_sync(&np->timer);
 	rio_hw_stop(dev);
 
 	return 0;
@@ -1843,7 +1842,7 @@ static int rio_resume(struct device *device)
 	return 0;
 }
 
-static SIMPLE_DEV_PM_OPS(rio_pm_ops, rio_suspend, rio_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(rio_pm_ops, rio_suspend, rio_resume);
 #define RIO_PM_OPS    (&rio_pm_ops)
 
 #else

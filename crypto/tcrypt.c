@@ -25,14 +25,17 @@
 #include <linux/err.h>
 #include <linux/fips.h>
 #include <linux/init.h>
-#include <linux/gfp.h>
-#include <linux/module.h>
-#include <linux/scatterlist.h>
-#include <linux/string.h>
-#include <linux/moduleparam.h>
-#include <linux/jiffies.h>
-#include <linux/timex.h>
 #include <linux/interrupt.h>
+#include <linux/jiffies.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/scatterlist.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/timex.h>
+
+#include "internal.h"
 #include "tcrypt.h"
 
 /*
@@ -711,6 +714,207 @@ static inline int do_one_ahash_op(struct ahash_request *req, int ret)
 	struct crypto_wait *wait = req->base.data;
 
 	return crypto_wait_req(ret, wait);
+}
+
+struct test_mb_ahash_data {
+	struct scatterlist sg[XBUFSIZE];
+	char result[64];
+	struct ahash_request *req;
+	struct crypto_wait wait;
+	char *xbuf[XBUFSIZE];
+};
+
+static inline int do_mult_ahash_op(struct test_mb_ahash_data *data, u32 num_mb,
+				   int *rc)
+{
+	int i, err;
+
+	/* Fire up a bunch of concurrent requests */
+	err = crypto_ahash_digest(data[0].req);
+
+	/* Wait for all requests to finish */
+	err = crypto_wait_req(err, &data[0].wait);
+	if (num_mb < 2)
+		return err;
+
+	for (i = 0; i < num_mb; i++) {
+		rc[i] = ahash_request_err(data[i].req);
+		if (rc[i]) {
+			pr_info("concurrent request %d error %d\n", i, rc[i]);
+			err = rc[i];
+		}
+	}
+
+	return err;
+}
+
+static int test_mb_ahash_jiffies(struct test_mb_ahash_data *data, int blen,
+				 int secs, u32 num_mb)
+{
+	unsigned long start, end;
+	int bcount;
+	int ret = 0;
+	int *rc;
+
+	rc = kcalloc(num_mb, sizeof(*rc), GFP_KERNEL);
+	if (!rc)
+		return -ENOMEM;
+
+	for (start = jiffies, end = start + secs * HZ, bcount = 0;
+	     time_before(jiffies, end); bcount++) {
+		ret = do_mult_ahash_op(data, num_mb, rc);
+		if (ret)
+			goto out;
+	}
+
+	pr_cont("%d operations in %d seconds (%llu bytes)\n",
+		bcount * num_mb, secs, (u64)bcount * blen * num_mb);
+
+out:
+	kfree(rc);
+	return ret;
+}
+
+static int test_mb_ahash_cycles(struct test_mb_ahash_data *data, int blen,
+				u32 num_mb)
+{
+	unsigned long cycles = 0;
+	int ret = 0;
+	int i;
+	int *rc;
+
+	rc = kcalloc(num_mb, sizeof(*rc), GFP_KERNEL);
+	if (!rc)
+		return -ENOMEM;
+
+	/* Warm-up run. */
+	for (i = 0; i < 4; i++) {
+		ret = do_mult_ahash_op(data, num_mb, rc);
+		if (ret)
+			goto out;
+	}
+
+	/* The real thing. */
+	for (i = 0; i < 8; i++) {
+		cycles_t start, end;
+
+		start = get_cycles();
+		ret = do_mult_ahash_op(data, num_mb, rc);
+		end = get_cycles();
+
+		if (ret)
+			goto out;
+
+		cycles += end - start;
+	}
+
+	pr_cont("1 operation in %lu cycles (%d bytes)\n",
+		(cycles + 4) / (8 * num_mb), blen);
+
+out:
+	kfree(rc);
+	return ret;
+}
+
+static void test_mb_ahash_speed(const char *algo, unsigned int secs,
+				struct hash_speed *speed, u32 num_mb)
+{
+	struct test_mb_ahash_data *data;
+	struct crypto_ahash *tfm;
+	unsigned int i, j, k;
+	int ret;
+
+	data = kcalloc(num_mb, sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return;
+
+	tfm = crypto_alloc_ahash(algo, 0, 0);
+	if (IS_ERR(tfm)) {
+		pr_err("failed to load transform for %s: %ld\n",
+			algo, PTR_ERR(tfm));
+		goto free_data;
+	}
+
+	for (i = 0; i < num_mb; ++i) {
+		if (testmgr_alloc_buf(data[i].xbuf))
+			goto out;
+
+		crypto_init_wait(&data[i].wait);
+
+		data[i].req = ahash_request_alloc(tfm, GFP_KERNEL);
+		if (!data[i].req) {
+			pr_err("alg: hash: Failed to allocate request for %s\n",
+			       algo);
+			goto out;
+		}
+
+
+		if (i) {
+			ahash_request_set_callback(data[i].req, 0, NULL, NULL);
+			ahash_request_chain(data[i].req, data[0].req);
+		} else
+			ahash_request_set_callback(data[0].req, 0,
+						   crypto_req_done,
+						   &data[0].wait);
+
+		sg_init_table(data[i].sg, XBUFSIZE);
+		for (j = 0; j < XBUFSIZE; j++) {
+			sg_set_buf(data[i].sg + j, data[i].xbuf[j], PAGE_SIZE);
+			memset(data[i].xbuf[j], 0xff, PAGE_SIZE);
+		}
+	}
+
+	pr_info("\ntesting speed of multibuffer %s (%s)\n", algo,
+		get_driver_name(crypto_ahash, tfm));
+
+	for (i = 0; speed[i].blen != 0; i++) {
+		/* For some reason this only tests digests. */
+		if (speed[i].blen != speed[i].plen)
+			continue;
+
+		if (speed[i].blen > XBUFSIZE * PAGE_SIZE) {
+			pr_err("template (%u) too big for tvmem (%lu)\n",
+			       speed[i].blen, XBUFSIZE * PAGE_SIZE);
+			goto out;
+		}
+
+		if (klen)
+			crypto_ahash_setkey(tfm, tvmem[0], klen);
+
+		for (k = 0; k < num_mb; k++)
+			ahash_request_set_crypt(data[k].req, data[k].sg,
+						data[k].result, speed[i].blen);
+
+		pr_info("test%3u "
+			"(%5u byte blocks,%5u bytes per update,%4u updates): ",
+			i, speed[i].blen, speed[i].plen,
+			speed[i].blen / speed[i].plen);
+
+		if (secs) {
+			ret = test_mb_ahash_jiffies(data, speed[i].blen, secs,
+						    num_mb);
+			cond_resched();
+		} else {
+			ret = test_mb_ahash_cycles(data, speed[i].blen, num_mb);
+		}
+
+
+		if (ret) {
+			pr_err("At least one hashing failed ret=%d\n", ret);
+			break;
+		}
+	}
+
+out:
+	ahash_request_free(data[0].req);
+
+	for (k = 0; k < num_mb; ++k)
+		testmgr_free_buf(data[k].xbuf);
+
+	crypto_free_ahash(tfm);
+
+free_data:
+	kfree(data);
 }
 
 static int test_ahash_jiffies_digest(struct ahash_request *req, int blen,
@@ -1521,8 +1725,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		ret = min(ret, tcrypt_test("xts(aes)"));
 		ret = min(ret, tcrypt_test("ctr(aes)"));
 		ret = min(ret, tcrypt_test("rfc3686(ctr(aes))"));
-		ret = min(ret, tcrypt_test("ofb(aes)"));
-		ret = min(ret, tcrypt_test("cfb(aes)"));
 		ret = min(ret, tcrypt_test("xctr(aes)"));
 		break;
 
@@ -1653,10 +1855,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		ret = min(ret, tcrypt_test("ghash"));
 		break;
 
-	case 47:
-		ret = min(ret, tcrypt_test("crct10dif"));
-		break;
-
 	case 48:
 		ret = min(ret, tcrypt_test("sha3-224"));
 		break;
@@ -1735,10 +1933,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 
 	case 108:
 		ret = min(ret, tcrypt_test("hmac(rmd160)"));
-		break;
-
-	case 109:
-		ret = min(ret, tcrypt_test("vmac64(aes)"));
 		break;
 
 	case 111:
@@ -1842,15 +2036,16 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 	case 191:
 		ret = min(ret, tcrypt_test("ecb(sm4)"));
 		ret = min(ret, tcrypt_test("cbc(sm4)"));
-		ret = min(ret, tcrypt_test("cfb(sm4)"));
 		ret = min(ret, tcrypt_test("ctr(sm4)"));
 		ret = min(ret, tcrypt_test("xts(sm4)"));
 		break;
 	case 192:
 		ret = min(ret, tcrypt_test("ecb(aria)"));
 		ret = min(ret, tcrypt_test("cbc(aria)"));
-		ret = min(ret, tcrypt_test("cfb(aria)"));
 		ret = min(ret, tcrypt_test("ctr(aria)"));
+		break;
+	case 193:
+		ret = min(ret, tcrypt_test("ffdhe2048(dh)"));
 		break;
 	case 200:
 		test_cipher_speed("ecb(aes)", ENCRYPT, sec, NULL, 0,
@@ -1876,10 +2071,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		test_cipher_speed("ctr(aes)", ENCRYPT, sec, NULL, 0,
 				speed_template_16_24_32);
 		test_cipher_speed("ctr(aes)", DECRYPT, sec, NULL, 0,
-				speed_template_16_24_32);
-		test_cipher_speed("cfb(aes)", ENCRYPT, sec, NULL, 0,
-				speed_template_16_24_32);
-		test_cipher_speed("cfb(aes)", DECRYPT, sec, NULL, 0,
 				speed_template_16_24_32);
 		break;
 
@@ -2044,11 +2235,11 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 
 	case 211:
 		test_aead_speed("rfc4106(gcm(aes))", ENCRYPT, sec,
-				NULL, 0, 16, 16, aead_speed_template_20);
+				NULL, 0, 16, 16, aead_speed_template_20_28_36);
 		test_aead_speed("gcm(aes)", ENCRYPT, sec,
 				NULL, 0, 16, 8, speed_template_16_24_32);
 		test_aead_speed("rfc4106(gcm(aes))", DECRYPT, sec,
-				NULL, 0, 16, 16, aead_speed_template_20);
+				NULL, 0, 16, 16, aead_speed_template_20_28_36);
 		test_aead_speed("gcm(aes)", DECRYPT, sec,
 				NULL, 0, 16, 8, speed_template_16_24_32);
 		break;
@@ -2074,11 +2265,11 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 
 	case 215:
 		test_mb_aead_speed("rfc4106(gcm(aes))", ENCRYPT, sec, NULL,
-				   0, 16, 16, aead_speed_template_20, num_mb);
+				   0, 16, 16, aead_speed_template_20_28_36, num_mb);
 		test_mb_aead_speed("gcm(aes)", ENCRYPT, sec, NULL, 0, 16, 8,
 				   speed_template_16_24_32, num_mb);
 		test_mb_aead_speed("rfc4106(gcm(aes))", DECRYPT, sec, NULL,
-				   0, 16, 16, aead_speed_template_20, num_mb);
+				   0, 16, 16, aead_speed_template_20_28_36, num_mb);
 		test_mb_aead_speed("gcm(aes)", DECRYPT, sec, NULL, 0, 16, 8,
 				   speed_template_16_24_32, num_mb);
 		break;
@@ -2111,10 +2302,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		test_cipher_speed("cts(cbc(sm4))", ENCRYPT, sec, NULL, 0,
 				speed_template_16);
 		test_cipher_speed("cts(cbc(sm4))", DECRYPT, sec, NULL, 0,
-				speed_template_16);
-		test_cipher_speed("cfb(sm4)", ENCRYPT, sec, NULL, 0,
-				speed_template_16);
-		test_cipher_speed("cfb(sm4)", DECRYPT, sec, NULL, 0,
 				speed_template_16);
 		test_cipher_speed("ctr(sm4)", ENCRYPT, sec, NULL, 0,
 				speed_template_16);
@@ -2194,10 +2381,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		test_cipher_speed("cbc(aria)", ENCRYPT, sec, NULL, 0,
 				  speed_template_16_24_32);
 		test_cipher_speed("cbc(aria)", DECRYPT, sec, NULL, 0,
-				  speed_template_16_24_32);
-		test_cipher_speed("cfb(aria)", ENCRYPT, sec, NULL, 0,
-				  speed_template_16_24_32);
-		test_cipher_speed("cfb(aria)", DECRYPT, sec, NULL, 0,
 				  speed_template_16_24_32);
 		test_cipher_speed("ctr(aria)", ENCRYPT, sec, NULL, 0,
 				  speed_template_16_24_32);
@@ -2284,10 +2467,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		fallthrough;
 	case 319:
 		test_hash_speed("crc32c", sec, generic_hash_speed_template);
-		if (mode > 300 && mode < 400) break;
-		fallthrough;
-	case 320:
-		test_hash_speed("crct10dif", sec, generic_hash_speed_template);
 		if (mode > 300 && mode < 400) break;
 		fallthrough;
 	case 321:
@@ -2405,6 +2584,36 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		test_ahash_speed("sm3", sec, generic_hash_speed_template);
 		if (mode > 400 && mode < 500) break;
 		fallthrough;
+	case 450:
+		test_mb_ahash_speed("sha1", sec, generic_hash_speed_template,
+				    num_mb);
+		if (mode > 400 && mode < 500) break;
+		fallthrough;
+	case 451:
+		test_mb_ahash_speed("sha256", sec, generic_hash_speed_template,
+				    num_mb);
+		if (mode > 400 && mode < 500) break;
+		fallthrough;
+	case 452:
+		test_mb_ahash_speed("sha512", sec, generic_hash_speed_template,
+				    num_mb);
+		if (mode > 400 && mode < 500) break;
+		fallthrough;
+	case 453:
+		test_mb_ahash_speed("sm3", sec, generic_hash_speed_template,
+				    num_mb);
+		if (mode > 400 && mode < 500) break;
+		fallthrough;
+	case 454:
+		test_mb_ahash_speed("streebog256", sec,
+				    generic_hash_speed_template, num_mb);
+		if (mode > 400 && mode < 500) break;
+		fallthrough;
+	case 455:
+		test_mb_ahash_speed("streebog512", sec,
+				    generic_hash_speed_template, num_mb);
+		if (mode > 400 && mode < 500) break;
+		fallthrough;
 	case 499:
 		break;
 
@@ -2433,14 +2642,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 				   speed_template_16_24_32);
 		test_acipher_speed("ctr(aes)", DECRYPT, sec, NULL, 0,
 				   speed_template_16_24_32);
-		test_acipher_speed("cfb(aes)", ENCRYPT, sec, NULL, 0,
-				   speed_template_16_24_32);
-		test_acipher_speed("cfb(aes)", DECRYPT, sec, NULL, 0,
-				   speed_template_16_24_32);
-		test_acipher_speed("ofb(aes)", ENCRYPT, sec, NULL, 0,
-				   speed_template_16_24_32);
-		test_acipher_speed("ofb(aes)", DECRYPT, sec, NULL, 0,
-				   speed_template_16_24_32);
 		test_acipher_speed("rfc3686(ctr(aes))", ENCRYPT, sec, NULL, 0,
 				   speed_template_20_28_36);
 		test_acipher_speed("rfc3686(ctr(aes))", DECRYPT, sec, NULL, 0,
@@ -2460,18 +2661,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		test_acipher_speed("cbc(des3_ede)", DECRYPT, sec,
 				   des3_speed_template, DES3_SPEED_VECTORS,
 				   speed_template_24);
-		test_acipher_speed("cfb(des3_ede)", ENCRYPT, sec,
-				   des3_speed_template, DES3_SPEED_VECTORS,
-				   speed_template_24);
-		test_acipher_speed("cfb(des3_ede)", DECRYPT, sec,
-				   des3_speed_template, DES3_SPEED_VECTORS,
-				   speed_template_24);
-		test_acipher_speed("ofb(des3_ede)", ENCRYPT, sec,
-				   des3_speed_template, DES3_SPEED_VECTORS,
-				   speed_template_24);
-		test_acipher_speed("ofb(des3_ede)", DECRYPT, sec,
-				   des3_speed_template, DES3_SPEED_VECTORS,
-				   speed_template_24);
 		break;
 
 	case 502:
@@ -2482,14 +2671,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		test_acipher_speed("cbc(des)", ENCRYPT, sec, NULL, 0,
 				   speed_template_8);
 		test_acipher_speed("cbc(des)", DECRYPT, sec, NULL, 0,
-				   speed_template_8);
-		test_acipher_speed("cfb(des)", ENCRYPT, sec, NULL, 0,
-				   speed_template_8);
-		test_acipher_speed("cfb(des)", DECRYPT, sec, NULL, 0,
-				   speed_template_8);
-		test_acipher_speed("ofb(des)", ENCRYPT, sec, NULL, 0,
-				   speed_template_8);
-		test_acipher_speed("ofb(des)", DECRYPT, sec, NULL, 0,
 				   speed_template_8);
 		break;
 
@@ -2629,10 +2810,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 				speed_template_16);
 		test_acipher_speed("cbc(sm4)", DECRYPT, sec, NULL, 0,
 				speed_template_16);
-		test_acipher_speed("cfb(sm4)", ENCRYPT, sec, NULL, 0,
-				speed_template_16);
-		test_acipher_speed("cfb(sm4)", DECRYPT, sec, NULL, 0,
-				speed_template_16);
 		test_acipher_speed("ctr(sm4)", ENCRYPT, sec, NULL, 0,
 				speed_template_16);
 		test_acipher_speed("ctr(sm4)", DECRYPT, sec, NULL, 0,
@@ -2655,6 +2832,15 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		break;
 
 	case 600:
+		if (alg) {
+			u8 speed_template[2] = {klen, 0};
+			test_mb_skcipher_speed(alg, ENCRYPT, sec, NULL, 0,
+					       speed_template, num_mb);
+			test_mb_skcipher_speed(alg, DECRYPT, sec, NULL, 0,
+					       speed_template, num_mb);
+			break;
+		}
+
 		test_mb_skcipher_speed("ecb(aes)", ENCRYPT, sec, NULL, 0,
 				       speed_template_16_24_32, num_mb);
 		test_mb_skcipher_speed("ecb(aes)", DECRYPT, sec, NULL, 0,
@@ -2679,14 +2865,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 				       speed_template_16_24_32, num_mb);
 		test_mb_skcipher_speed("ctr(aes)", DECRYPT, sec, NULL, 0,
 				       speed_template_16_24_32, num_mb);
-		test_mb_skcipher_speed("cfb(aes)", ENCRYPT, sec, NULL, 0,
-				       speed_template_16_24_32, num_mb);
-		test_mb_skcipher_speed("cfb(aes)", DECRYPT, sec, NULL, 0,
-				       speed_template_16_24_32, num_mb);
-		test_mb_skcipher_speed("ofb(aes)", ENCRYPT, sec, NULL, 0,
-				       speed_template_16_24_32, num_mb);
-		test_mb_skcipher_speed("ofb(aes)", DECRYPT, sec, NULL, 0,
-				       speed_template_16_24_32, num_mb);
 		test_mb_skcipher_speed("rfc3686(ctr(aes))", ENCRYPT, sec, NULL,
 				       0, speed_template_20_28_36, num_mb);
 		test_mb_skcipher_speed("rfc3686(ctr(aes))", DECRYPT, sec, NULL,
@@ -2706,18 +2884,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		test_mb_skcipher_speed("cbc(des3_ede)", DECRYPT, sec,
 				       des3_speed_template, DES3_SPEED_VECTORS,
 				       speed_template_24, num_mb);
-		test_mb_skcipher_speed("cfb(des3_ede)", ENCRYPT, sec,
-				       des3_speed_template, DES3_SPEED_VECTORS,
-				       speed_template_24, num_mb);
-		test_mb_skcipher_speed("cfb(des3_ede)", DECRYPT, sec,
-				       des3_speed_template, DES3_SPEED_VECTORS,
-				       speed_template_24, num_mb);
-		test_mb_skcipher_speed("ofb(des3_ede)", ENCRYPT, sec,
-				       des3_speed_template, DES3_SPEED_VECTORS,
-				       speed_template_24, num_mb);
-		test_mb_skcipher_speed("ofb(des3_ede)", DECRYPT, sec,
-				       des3_speed_template, DES3_SPEED_VECTORS,
-				       speed_template_24, num_mb);
 		break;
 
 	case 602:
@@ -2728,14 +2894,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		test_mb_skcipher_speed("cbc(des)", ENCRYPT, sec, NULL, 0,
 				       speed_template_8, num_mb);
 		test_mb_skcipher_speed("cbc(des)", DECRYPT, sec, NULL, 0,
-				       speed_template_8, num_mb);
-		test_mb_skcipher_speed("cfb(des)", ENCRYPT, sec, NULL, 0,
-				       speed_template_8, num_mb);
-		test_mb_skcipher_speed("cfb(des)", DECRYPT, sec, NULL, 0,
-				       speed_template_8, num_mb);
-		test_mb_skcipher_speed("ofb(des)", ENCRYPT, sec, NULL, 0,
-				       speed_template_8, num_mb);
-		test_mb_skcipher_speed("ofb(des)", DECRYPT, sec, NULL, 0,
 				       speed_template_8, num_mb);
 		break;
 

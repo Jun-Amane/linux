@@ -342,7 +342,8 @@ static void rxperf_deliver_to_call(struct work_struct *work)
 call_complete:
 	rxperf_set_call_complete(call, ret, remote_abort);
 	/* The call may have been requeued */
-	rxrpc_kernel_end_call(rxperf_socket, call->rxcall);
+	rxrpc_kernel_shutdown_call(rxperf_socket, call->rxcall);
+	rxrpc_kernel_put_call(rxperf_socket, call->rxcall);
 	cancel_work(&call->work);
 	kfree(call);
 }
@@ -477,6 +478,18 @@ static int rxperf_deliver_request(struct rxperf_call *call)
 		call->unmarshal++;
 		fallthrough;
 	case 2:
+		ret = rxperf_extract_data(call, true);
+		if (ret < 0)
+			return ret;
+
+		/* Deal with the terminal magic cookie. */
+		call->iov_len = 4;
+		call->kvec[0].iov_len	= call->iov_len;
+		call->kvec[0].iov_base	= call->tmp;
+		iov_iter_kvec(&call->iter, READ, call->kvec, 1, call->iov_len);
+		call->unmarshal++;
+		fallthrough;
+	case 3:
 		ret = rxperf_extract_data(call, false);
 		if (ret < 0)
 			return ret;
@@ -493,7 +506,7 @@ static int rxperf_deliver_request(struct rxperf_call *call)
 static int rxperf_process_call(struct rxperf_call *call)
 {
 	struct msghdr msg = {};
-	struct bio_vec bv[1];
+	struct bio_vec bv;
 	struct kvec iov[1];
 	ssize_t n;
 	size_t reply_len = call->reply_len, len;
@@ -502,11 +515,9 @@ static int rxperf_process_call(struct rxperf_call *call)
 				   reply_len + sizeof(rxperf_magic_cookie));
 
 	while (reply_len > 0) {
-		len = min_t(size_t, reply_len, PAGE_SIZE);
-		bv[0].bv_page	= ZERO_PAGE(0);
-		bv[0].bv_offset	= 0;
-		bv[0].bv_len	= len;
-		iov_iter_bvec(&msg.msg_iter, WRITE, bv, 1, len);
+		len = umin(reply_len, PAGE_SIZE);
+		bvec_set_page(&bv, ZERO_PAGE(0), len, 0);
+		iov_iter_bvec(&msg.msg_iter, WRITE, &bv, 1, len);
 		msg.msg_flags = MSG_MORE;
 		n = rxrpc_kernel_send_data(rxperf_socket, call->rxcall, &msg,
 					   len, rxperf_notify_end_reply_tx);

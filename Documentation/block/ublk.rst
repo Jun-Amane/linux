@@ -144,6 +144,43 @@ managing and controlling ublk devices with help of several control commands:
   For retrieving device info via ``ublksrv_ctrl_dev_info``. It is the server's
   responsibility to save IO target specific info in userspace.
 
+- ``UBLK_CMD_GET_DEV_INFO2``
+  Same purpose with ``UBLK_CMD_GET_DEV_INFO``, but ublk server has to
+  provide path of the char device of ``/dev/ublkc*`` for kernel to run
+  permission check, and this command is added for supporting unprivileged
+  ublk device, and introduced with ``UBLK_F_UNPRIVILEGED_DEV`` together.
+  Only the user owning the requested device can retrieve the device info.
+
+  How to deal with userspace/kernel compatibility:
+
+  1) if kernel is capable of handling ``UBLK_F_UNPRIVILEGED_DEV``
+
+    If ublk server supports ``UBLK_F_UNPRIVILEGED_DEV``:
+
+    ublk server should send ``UBLK_CMD_GET_DEV_INFO2``, given anytime
+    unprivileged application needs to query devices the current user owns,
+    when the application has no idea if ``UBLK_F_UNPRIVILEGED_DEV`` is set
+    given the capability info is stateless, and application should always
+    retrieve it via ``UBLK_CMD_GET_DEV_INFO2``
+
+    If ublk server doesn't support ``UBLK_F_UNPRIVILEGED_DEV``:
+
+    ``UBLK_CMD_GET_DEV_INFO`` is always sent to kernel, and the feature of
+    UBLK_F_UNPRIVILEGED_DEV isn't available for user
+
+  2) if kernel isn't capable of handling ``UBLK_F_UNPRIVILEGED_DEV``
+
+    If ublk server supports ``UBLK_F_UNPRIVILEGED_DEV``:
+
+    ``UBLK_CMD_GET_DEV_INFO2`` is tried first, and will be failed, then
+    ``UBLK_CMD_GET_DEV_INFO`` needs to be retried given
+    ``UBLK_F_UNPRIVILEGED_DEV`` can't be set
+
+    If ublk server doesn't support ``UBLK_F_UNPRIVILEGED_DEV``:
+
+    ``UBLK_CMD_GET_DEV_INFO`` is always sent to kernel, and the feature of
+    ``UBLK_F_UNPRIVILEGED_DEV`` isn't available for user
+
 - ``UBLK_CMD_START_USER_RECOVERY``
 
   This command is valid if ``UBLK_F_USER_RECOVERY`` feature is enabled. This
@@ -162,23 +199,44 @@ managing and controlling ublk devices with help of several control commands:
 
 - user recovery feature description
 
-  Two new features are added for user recovery: ``UBLK_F_USER_RECOVERY`` and
-  ``UBLK_F_USER_RECOVERY_REISSUE``.
+  Three new features are added for user recovery: ``UBLK_F_USER_RECOVERY``,
+  ``UBLK_F_USER_RECOVERY_REISSUE``, and ``UBLK_F_USER_RECOVERY_FAIL_IO``. To
+  enable recovery of ublk devices after the ublk server exits, the ublk server
+  should specify the ``UBLK_F_USER_RECOVERY`` flag when creating the device. The
+  ublk server may additionally specify at most one of
+  ``UBLK_F_USER_RECOVERY_REISSUE`` and ``UBLK_F_USER_RECOVERY_FAIL_IO`` to
+  modify how I/O is handled while the ublk server is dying/dead (this is called
+  the ``nosrv`` case in the driver code).
 
-  With ``UBLK_F_USER_RECOVERY`` set, after one ubq_daemon(ublk server's io
+  With just ``UBLK_F_USER_RECOVERY`` set, after one ubq_daemon(ublk server's io
   handler) is dying, ublk does not delete ``/dev/ublkb*`` during the whole
   recovery stage and ublk device ID is kept. It is ublk server's
   responsibility to recover the device context by its own knowledge.
   Requests which have not been issued to userspace are requeued. Requests
   which have been issued to userspace are aborted.
 
-  With ``UBLK_F_USER_RECOVERY_REISSUE`` set, after one ubq_daemon(ublk
-  server's io handler) is dying, contrary to ``UBLK_F_USER_RECOVERY``,
+  With ``UBLK_F_USER_RECOVERY_REISSUE`` additionally set, after one ubq_daemon
+  (ublk server's io handler) is dying, contrary to ``UBLK_F_USER_RECOVERY``,
   requests which have been issued to userspace are requeued and will be
   re-issued to the new process after handling ``UBLK_CMD_END_USER_RECOVERY``.
   ``UBLK_F_USER_RECOVERY_REISSUE`` is designed for backends who tolerate
   double-write since the driver may issue the same I/O request twice. It
   might be useful to a read-only FS or a VM backend.
+
+  With ``UBLK_F_USER_RECOVERY_FAIL_IO`` additionally set, after the ublk server
+  exits, requests which have issued to userspace are failed, as are any
+  subsequently issued requests. Applications continuously issuing I/O against
+  devices with this flag set will see a stream of I/O errors until a new ublk
+  server recovers the device.
+
+Unprivileged ublk device is supported by passing ``UBLK_F_UNPRIVILEGED_DEV``.
+Once the flag is set, all control commands can be sent by unprivileged
+user. Except for command of ``UBLK_CMD_ADD_DEV``, permission check on
+the specified char device(``/dev/ublkc*``) is done for all other control
+commands by ublk driver, for doing that, path of the char device has to
+be provided in these commands' payload from ublk server. With this way,
+ublk device becomes container-ware, and device created in one container
+can be controlled/accessed just inside this container.
 
 Data plane
 ----------
@@ -192,7 +250,7 @@ The's IO is assigned by a unique tag, which is 1:1 mapping with IO
 request of ``/dev/ublkb*``.
 
 UAPI structure of ``ublksrv_io_desc`` is defined for describing each IO from
-the driver. A fixed mmaped area (array) on ``/dev/ublkc*`` is provided for
+the driver. A fixed mmapped area (array) on ``/dev/ublkc*`` is provided for
 exporting IO info to the server; such as IO offset, length, OP/flags and
 buffer address. Each ``ublksrv_io_desc`` instance can be indexed via queue id
 and IO tag directly.
@@ -251,27 +309,35 @@ with specified IO tag in the command data:
   ``UBLK_IO_COMMIT_AND_FETCH_REQ`` to the server, ublkdrv needs to copy
   the server buffer (pages) read to the IO request pages.
 
-Future development
-==================
-
-Container-aware ublk deivice
-----------------------------
-
-ublk driver doesn't handle any IO logic. Its function is well defined
-for now and very limited userspace interfaces are needed, which is also
-well defined too. It is possible to make ublk devices container-aware block
-devices in future as Stefan Hajnoczi suggested [#stefan]_, by removing
-ADMIN privilege.
-
 Zero copy
 ---------
 
-Zero copy is a generic requirement for nbd, fuse or similar drivers. A
-problem [#xiaoguang]_ Xiaoguang mentioned is that pages mapped to userspace
-can't be remapped any more in kernel with existing mm interfaces. This can
-occurs when destining direct IO to ``/dev/ublkb*``. Also, he reported that
-big requests (IO size >= 256 KB) may benefit a lot from zero copy.
+ublk zero copy relies on io_uring's fixed kernel buffer, which provides
+two APIs: `io_buffer_register_bvec()` and `io_buffer_unregister_bvec`.
 
+ublk adds IO command of `UBLK_IO_REGISTER_IO_BUF` to call
+`io_buffer_register_bvec()` for ublk server to register client request
+buffer into io_uring buffer table, then ublk server can submit io_uring
+IOs with the registered buffer index. IO command of `UBLK_IO_UNREGISTER_IO_BUF`
+calls `io_buffer_unregister_bvec()` to unregister the buffer, which is
+guaranteed to be live between calling `io_buffer_register_bvec()` and
+`io_buffer_unregister_bvec()`. Any io_uring operation which supports this
+kind of kernel buffer will grab one reference of the buffer until the
+operation is completed.
+
+ublk server implementing zero copy or user copy has to be CAP_SYS_ADMIN and
+be trusted, because it is ublk server's responsibility to make sure IO buffer
+filled with data for handling read command, and ublk server has to return
+correct result to ublk driver when handling READ command, and the result
+has to match with how many bytes filled to the IO buffer. Otherwise,
+uninitialized kernel IO buffer will be exposed to client application.
+
+ublk server needs to align the parameter of `struct ublk_param_dma_align`
+with backend for zero copy to work correctly.
+
+For reaching best IO performance, ublk server should align its segment
+parameter of `struct ublk_param_segment` with backend for avoiding
+unnecessary IO split, which usually hurts io_uring performance.
 
 References
 ==========
@@ -283,7 +349,3 @@ References
 .. [#userspace_nbdublk] https://gitlab.com/rwmjones/libnbd/-/tree/nbdublk
 
 .. [#userspace_readme] https://github.com/ming1/ubdsrv/blob/master/README
-
-.. [#stefan] https://lore.kernel.org/linux-block/YoOr6jBfgVm8GvWg@stefanha-x1.localdomain/
-
-.. [#xiaoguang] https://lore.kernel.org/linux-block/YoOr6jBfgVm8GvWg@stefanha-x1.localdomain/

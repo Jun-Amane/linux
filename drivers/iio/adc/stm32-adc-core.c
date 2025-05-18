@@ -17,8 +17,11 @@
 #include <linux/irqdomain.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
+#include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
@@ -612,8 +615,7 @@ static int stm32_adc_core_switches_probe(struct device *dev,
 	}
 
 	/* Booster can be used to supply analog switches (optional) */
-	if (priv->cfg->has_syscfg & HAS_VBOOSTER &&
-	    of_property_read_bool(np, "booster-supply")) {
+	if (priv->cfg->has_syscfg & HAS_VBOOSTER) {
 		priv->booster = devm_regulator_get_optional(dev, "booster");
 		if (IS_ERR(priv->booster)) {
 			ret = PTR_ERR(priv->booster);
@@ -625,8 +627,7 @@ static int stm32_adc_core_switches_probe(struct device *dev,
 	}
 
 	/* Vdd can be used to supply analog switches (optional) */
-	if (priv->cfg->has_syscfg & HAS_ANASWVDD &&
-	    of_property_read_bool(np, "vdd-supply")) {
+	if (priv->cfg->has_syscfg & HAS_ANASWVDD) {
 		priv->vdd = devm_regulator_get_optional(dev, "vdd");
 		if (IS_ERR(priv->vdd)) {
 			ret = PTR_ERR(priv->vdd);
@@ -718,13 +719,11 @@ static int stm32_adc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	platform_set_drvdata(pdev, &priv->common);
 
-	priv->cfg = (const struct stm32_adc_priv_cfg *)
-		of_match_device(dev->driver->of_match_table, dev)->data;
+	priv->cfg = device_get_match_data(dev);
 	priv->nb_adc_max = priv->cfg->num_adcs;
 	spin_lock_init(&priv->common.lock);
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	priv->common.base = devm_ioremap_resource(&pdev->dev, res);
+	priv->common.base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(priv->common.base))
 		return PTR_ERR(priv->common.base);
 	priv->common.phys_base = res->start;
@@ -813,7 +812,7 @@ err_pm_stop:
 	return ret;
 }
 
-static int stm32_adc_remove(struct platform_device *pdev)
+static void stm32_adc_remove(struct platform_device *pdev)
 {
 	struct stm32_adc_common *common = platform_get_drvdata(pdev);
 	struct stm32_adc_priv *priv = to_stm32_adc_priv(common);
@@ -825,8 +824,6 @@ static int stm32_adc_remove(struct platform_device *pdev)
 	pm_runtime_disable(&pdev->dev);
 	pm_runtime_set_suspended(&pdev->dev);
 	pm_runtime_put_noidle(&pdev->dev);
-
-	return 0;
 }
 
 static int stm32_adc_core_runtime_suspend(struct device *dev)

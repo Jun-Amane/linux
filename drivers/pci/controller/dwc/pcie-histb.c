@@ -198,7 +198,7 @@ static int histb_pcie_host_init(struct dw_pcie_rp *pp)
 }
 
 static const struct dw_pcie_host_ops histb_pcie_host_ops = {
-	.host_init = histb_pcie_host_init,
+	.init = histb_pcie_host_init,
 };
 
 static void histb_pcie_host_disable(struct histb_pcie *hipcie)
@@ -409,28 +409,30 @@ static int histb_pcie_probe(struct platform_device *pdev)
 	ret = histb_pcie_host_enable(pp);
 	if (ret) {
 		dev_err(dev, "failed to enable host\n");
-		return ret;
+		goto err_exit_phy;
 	}
 
 	ret = dw_pcie_host_init(pp);
 	if (ret) {
 		dev_err(dev, "failed to initialize host\n");
-		return ret;
+		goto err_exit_phy;
 	}
 
 	return 0;
+
+err_exit_phy:
+	phy_exit(hipcie->phy);
+
+	return ret;
 }
 
-static int histb_pcie_remove(struct platform_device *pdev)
+static void histb_pcie_remove(struct platform_device *pdev)
 {
 	struct histb_pcie *hipcie = platform_get_drvdata(pdev);
 
 	histb_pcie_host_disable(hipcie);
 
-	if (hipcie->phy)
-		phy_exit(hipcie->phy);
-
-	return 0;
+	phy_exit(hipcie->phy);
 }
 
 static const struct of_device_id histb_pcie_of_match[] = {
@@ -441,7 +443,7 @@ MODULE_DEVICE_TABLE(of, histb_pcie_of_match);
 
 static struct platform_driver histb_pcie_platform_driver = {
 	.probe	= histb_pcie_probe,
-	.remove	= histb_pcie_remove,
+	.remove = histb_pcie_remove,
 	.driver = {
 		.name = "histb-pcie",
 		.of_match_table = histb_pcie_of_match,
@@ -450,4 +452,3 @@ static struct platform_driver histb_pcie_platform_driver = {
 module_platform_driver(histb_pcie_platform_driver);
 
 MODULE_DESCRIPTION("HiSilicon STB PCIe host controller driver");
-MODULE_LICENSE("GPL v2");

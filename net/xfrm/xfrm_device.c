@@ -15,6 +15,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <net/dst.h>
+#include <net/gso.h>
 #include <net/xfrm.h>
 #include <linux/notifier.h>
 
@@ -41,7 +42,8 @@ static void __xfrm_mode_tunnel_prep(struct xfrm_state *x, struct sk_buff *skb,
 		skb->transport_header = skb->network_header + hsize;
 
 	skb_reset_mac_len(skb);
-	pskb_pull(skb, skb->mac_len + x->props.header_len);
+	pskb_pull(skb,
+		  skb->mac_len + x->props.header_len - x->props.enc_hdr_len);
 }
 
 static void __xfrm_mode_beet_prep(struct xfrm_state *x, struct sk_buff *skb,
@@ -67,6 +69,7 @@ static void __xfrm_mode_beet_prep(struct xfrm_state *x, struct sk_buff *skb,
 static void xfrm_outer_mode_prep(struct xfrm_state *x, struct sk_buff *skb)
 {
 	switch (x->outer_mode.encap) {
+	case XFRM_MODE_IPTFS:
 	case XFRM_MODE_TUNNEL:
 		if (x->outer_mode.family == AF_INET)
 			return __xfrm_mode_tunnel_prep(x, skb,
@@ -241,26 +244,30 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
 	xfrm_address_t *daddr;
 	bool is_packet_offload;
 
-	if (!x->type_offload) {
-		NL_SET_ERR_MSG(extack, "Type doesn't support offload");
-		return -EINVAL;
-	}
-
-	/* We don't yet support UDP encapsulation and TFC padding. */
-	if (x->encap || x->tfcpad) {
-		NL_SET_ERR_MSG(extack, "Encapsulation and TFC padding can't be offloaded");
-		return -EINVAL;
-	}
-
 	if (xuo->flags &
 	    ~(XFRM_OFFLOAD_IPV6 | XFRM_OFFLOAD_INBOUND | XFRM_OFFLOAD_PACKET)) {
 		NL_SET_ERR_MSG(extack, "Unrecognized flags in offload request");
 		return -EINVAL;
 	}
 
+	if ((xuo->flags & XFRM_OFFLOAD_INBOUND && x->dir == XFRM_SA_DIR_OUT) ||
+	    (!(xuo->flags & XFRM_OFFLOAD_INBOUND) && x->dir == XFRM_SA_DIR_IN)) {
+		NL_SET_ERR_MSG(extack, "Mismatched SA and offload direction");
+		return -EINVAL;
+	}
+
 	is_packet_offload = xuo->flags & XFRM_OFFLOAD_PACKET;
+
+	/* We don't yet support TFC padding. */
+	if (x->tfcpad) {
+		NL_SET_ERR_MSG(extack, "TFC padding can't be offloaded");
+		return -EINVAL;
+	}
+
 	dev = dev_get_by_index(net, xuo->ifindex);
 	if (!dev) {
+		struct xfrm_dst_lookup_params params;
+
 		if (!(xuo->flags & XFRM_OFFLOAD_INBOUND)) {
 			saddr = &x->props.saddr;
 			daddr = &x->id.daddr;
@@ -269,9 +276,12 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
 			daddr = &x->props.saddr;
 		}
 
-		dst = __xfrm_dst_lookup(net, 0, 0, saddr, daddr,
-					x->props.family,
-					xfrm_smark_get(0, x));
+		memset(&params, 0, sizeof(params));
+		params.net = net;
+		params.saddr = saddr;
+		params.daddr = daddr;
+		params.mark = xfrm_smark_get(0, x);
+		dst = __xfrm_dst_lookup(x->props.family, &params);
 		if (IS_ERR(dst))
 			return (is_packet_offload) ? -EINVAL : 0;
 
@@ -287,10 +297,17 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
 		return (is_packet_offload) ? -EINVAL : 0;
 	}
 
-	if (x->props.flags & XFRM_STATE_ESN &&
+	if (!is_packet_offload && x->props.flags & XFRM_STATE_ESN &&
 	    !dev->xfrmdev_ops->xdo_dev_state_advance_esn) {
 		NL_SET_ERR_MSG(extack, "Device doesn't support offload with ESN");
 		xso->dev = NULL;
+		dev_put(dev);
+		return -EINVAL;
+	}
+
+	xfrm_set_type_offload(x);
+	if (!x->type_offload) {
+		NL_SET_ERR_MSG(extack, "Type doesn't support offload");
 		dev_put(dev);
 		return -EINVAL;
 	}
@@ -309,7 +326,7 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
 	else
 		xso->type = XFRM_DEV_OFFLOAD_CRYPTO;
 
-	err = dev->xfrmdev_ops->xdo_dev_state_add(x);
+	err = dev->xfrmdev_ops->xdo_dev_state_add(x, extack);
 	if (err) {
 		xso->dev = NULL;
 		xso->dir = 0;
@@ -317,16 +334,13 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
 		netdev_put(dev, &xso->dev_tracker);
 		xso->type = XFRM_DEV_OFFLOAD_UNSPECIFIED;
 
+		xfrm_unset_type_offload(x);
 		/* User explicitly requested packet offload mode and configured
 		 * policy in addition to the XFRM state. So be civil to users,
 		 * and return an error instead of taking fallback path.
-		 *
-		 * This WARN_ON() can be seen as a documentation for driver
-		 * authors to do not return -EOPNOTSUPP in packet offload mode.
 		 */
-		WARN_ON(err == -EOPNOTSUPP && is_packet_offload);
-		if (err != -EOPNOTSUPP || is_packet_offload) {
-			NL_SET_ERR_MSG(extack, "Device failed to offload this state");
+		if ((err != -EOPNOTSUPP && !is_packet_offload) || is_packet_offload) {
+			NL_SET_ERR_MSG_WEAK(extack, "Device failed to offload this state");
 			return err;
 		}
 	}
@@ -378,19 +392,19 @@ int xfrm_dev_policy_add(struct net *net, struct xfrm_policy *xp,
 		break;
 	default:
 		xdo->dev = NULL;
-		dev_put(dev);
+		netdev_put(dev, &xdo->dev_tracker);
 		NL_SET_ERR_MSG(extack, "Unrecognized offload direction");
 		return -EINVAL;
 	}
 
-	err = dev->xfrmdev_ops->xdo_dev_policy_add(xp);
+	err = dev->xfrmdev_ops->xdo_dev_policy_add(xp, extack);
 	if (err) {
 		xdo->dev = NULL;
 		xdo->real_dev = NULL;
 		xdo->type = XFRM_DEV_OFFLOAD_UNSPECIFIED;
 		xdo->dir = 0;
 		netdev_put(dev, &xdo->dev_tracker);
-		NL_SET_ERR_MSG(extack, "Device failed to offload this policy");
+		NL_SET_ERR_MSG_WEAK(extack, "Device failed to offload this policy");
 		return err;
 	}
 
@@ -404,13 +418,12 @@ bool xfrm_dev_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
 	struct dst_entry *dst = skb_dst(skb);
 	struct xfrm_dst *xdst = (struct xfrm_dst *)dst;
 	struct net_device *dev = x->xso.dev;
+	bool check_tunnel_size;
 
-	if (!x->type_offload || x->encap)
+	if (x->xso.type == XFRM_DEV_OFFLOAD_UNSPECIFIED)
 		return false;
 
-	if (x->xso.type == XFRM_DEV_OFFLOAD_PACKET ||
-	    ((!dev || (dev == xfrm_dst_path(dst)->dev)) &&
-	     !xdst->child->xfrm)) {
+	if ((dev == xfrm_dst_path(dst)->dev) && !xdst->child->xfrm) {
 		mtu = xfrm_state_mtu(x, xdst->child_mtu_cached);
 		if (skb->len <= mtu)
 			goto ok;
@@ -422,8 +435,29 @@ bool xfrm_dev_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
 	return false;
 
 ok:
-	if (dev && dev->xfrmdev_ops && dev->xfrmdev_ops->xdo_dev_offload_ok)
-		return x->xso.dev->xfrmdev_ops->xdo_dev_offload_ok(skb, x);
+	check_tunnel_size = x->xso.type == XFRM_DEV_OFFLOAD_PACKET &&
+			    x->props.mode == XFRM_MODE_TUNNEL;
+	switch (x->props.family) {
+	case AF_INET:
+		/* Check for IPv4 options */
+		if (ip_hdr(skb)->ihl != 5)
+			return false;
+		if (check_tunnel_size && xfrm4_tunnel_check_size(skb))
+			return false;
+		break;
+	case AF_INET6:
+		/* Check for IPv6 extensions */
+		if (ipv6_ext_hdr(ipv6_hdr(skb)->nexthdr))
+			return false;
+		if (check_tunnel_size && xfrm6_tunnel_check_size(skb))
+			return false;
+		break;
+	default:
+		break;
+	}
+
+	if (dev->xfrmdev_ops->xdo_dev_offload_ok)
+		return dev->xfrmdev_ops->xdo_dev_offload_ok(skb, x);
 
 	return true;
 }

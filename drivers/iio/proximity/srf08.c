@@ -66,7 +66,7 @@ struct srf08_data {
 	/* Ensure timestamp is naturally aligned */
 	struct {
 		s16 chan;
-		s64 timestamp __aligned(8);
+		aligned_s64 timestamp;
 	} scan;
 
 	/* Sensor-Type */
@@ -549,7 +549,7 @@ static struct i2c_driver srf08_driver = {
 		.name	= "srf08",
 		.of_match_table	= of_srf08_match,
 	},
-	.probe_new = srf08_probe,
+	.probe = srf08_probe,
 	.id_table = srf08_id,
 };
 module_i2c_driver(srf08_driver);

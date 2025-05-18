@@ -86,7 +86,7 @@ following steps:
 The following are a few examples of selftest BPF iterator programs:
 
 * `bpf_iter_tcp4.c <https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git/tree/tools/testing/selftests/bpf/progs/bpf_iter_tcp4.c>`_
-* `bpf_iter_task_vma.c <https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git/tree/tools/testing/selftests/bpf/progs/bpf_iter_task_vma.c>`_
+* `bpf_iter_task_vmas.c <https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git/tree/tools/testing/selftests/bpf/progs/bpf_iter_task_vmas.c>`_
 * `bpf_iter_task_file.c <https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git/tree/tools/testing/selftests/bpf/progs/bpf_iter_task_file.c>`_
 
 Let us look at ``bpf_iter_task_file.c``, which runs in kernel space:
@@ -238,11 +238,8 @@ The following is the breakdown for each field in struct ``bpf_iter_reg``.
        that the kernel function cond_resched() is called to avoid other kernel
        subsystem (e.g., rcu) misbehaving.
    * - seq_info
-     - Specifies certain action requests in the kernel BPF iterator
-       infrastructure. Currently, only BPF_ITER_RESCHED is supported. This means
-       that the kernel function cond_resched() is called to avoid other kernel
-       subsystem (e.g., rcu) misbehaving.
-
+     - Specifies the set of seq operations for the BPF iterator and helpers to
+       initialize/free the private data for the corresponding ``seq_file``.
 
 `Click here
 <https://lore.kernel.org/bpf/20210212183107.50963-2-songliubraving@fb.com/>`_

@@ -41,44 +41,50 @@ const char *arch_ret_insn(int len)
 
 int arch_decode_instruction(struct objtool_file *file, const struct section *sec,
 			    unsigned long offset, unsigned int maxlen,
-			    unsigned int *len, enum insn_type *type,
-			    unsigned long *immediate,
-			    struct list_head *ops_list)
+			    struct instruction *insn)
 {
 	unsigned int opcode;
 	enum insn_type typ;
 	unsigned long imm;
-	u32 insn;
+	u32 ins;
 
-	insn = bswap_if_needed(file->elf, *(u32 *)(sec->data->d_buf + offset));
-	opcode = insn >> 26;
+	ins = bswap_if_needed(file->elf, *(u32 *)(sec->data->d_buf + offset));
+	opcode = ins >> 26;
 	typ = INSN_OTHER;
 	imm = 0;
 
 	switch (opcode) {
 	case 18: /* b[l][a] */
-		if ((insn & 3) == 1) /* bl */
+		if (ins == 0x48000005)	/* bl .+4 */
+			typ = INSN_OTHER;
+		else if (ins & 1)	/* bl[a] */
 			typ = INSN_CALL;
+		else		/* b[a] */
+			typ = INSN_JUMP_UNCONDITIONAL;
 
-		imm = insn & 0x3fffffc;
+		imm = ins & 0x3fffffc;
 		if (imm & 0x2000000)
 			imm -= 0x4000000;
+		imm |= ins & 2;	/* AA flag */
 		break;
 	}
 
 	if (opcode == 1)
-		*len = 8;
+		insn->len = 8;
 	else
-		*len = 4;
+		insn->len = 4;
 
-	*type = typ;
-	*immediate = imm;
+	insn->type = typ;
+	insn->immediate = imm;
 
 	return 0;
 }
 
 unsigned long arch_jump_destination(struct instruction *insn)
 {
+	if (insn->immediate & 2)
+		return insn->immediate & ~2;
+
 	return insn->offset + insn->immediate;
 }
 
@@ -107,4 +113,18 @@ void arch_initial_func_cfi_state(struct cfi_init_state *state)
 	/* initial LR (return address) */
 	state->regs[CFI_RA].base = CFI_CFA;
 	state->regs[CFI_RA].offset = 0;
+}
+
+unsigned int arch_reloc_size(struct reloc *reloc)
+{
+	switch (reloc_type(reloc)) {
+	case R_PPC_REL32:
+	case R_PPC_ADDR32:
+	case R_PPC_UADDR32:
+	case R_PPC_PLT32:
+	case R_PPC_PLTREL32:
+		return 4;
+	default:
+		return 8;
+	}
 }

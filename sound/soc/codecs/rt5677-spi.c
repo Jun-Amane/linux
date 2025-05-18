@@ -112,7 +112,7 @@ static int rt5677_spi_pcm_close(
 		struct snd_soc_component *component,
 		struct snd_pcm_substream *substream)
 {
-	struct snd_soc_pcm_runtime *rtd = asoc_substream_to_rtd(substream);
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct snd_soc_component *codec_component =
 			snd_soc_rtdcom_lookup(rtd, "rt5677");
 	struct rt5677_priv *rt5677 =
@@ -158,7 +158,7 @@ static int rt5677_spi_prepare(
 		struct snd_soc_component *component,
 		struct snd_pcm_substream *substream)
 {
-	struct snd_soc_pcm_runtime *rtd = asoc_substream_to_rtd(substream);
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct snd_soc_component *rt5677_component =
 			snd_soc_rtdcom_lookup(rtd, "rt5677");
 	struct rt5677_priv *rt5677 =
@@ -617,7 +617,8 @@ static int rt5677_spi_probe(struct spi_device *spi)
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id rt5677_spi_acpi_id[] = {
-	{ "RT5677AA", 0 },
+	{ "10EC5677" },
+	{ "RT5677AA" },
 	{ }
 };
 MODULE_DEVICE_TABLE(acpi, rt5677_spi_acpi_id);

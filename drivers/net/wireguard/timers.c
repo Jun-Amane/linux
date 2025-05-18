@@ -48,7 +48,7 @@ static void wg_expired_retransmit_handshake(struct timer_list *timer)
 			 peer->device->dev->name, peer->internal_id,
 			 &peer->endpoint.addr, (int)MAX_TIMER_HANDSHAKES + 2);
 
-		del_timer(&peer->timer_send_keepalive);
+		timer_delete(&peer->timer_send_keepalive);
 		/* We drop all packets without a keypair and don't try again,
 		 * if we try unsuccessfully for too long to make a handshake.
 		 */
@@ -167,7 +167,7 @@ void wg_timers_data_received(struct wg_peer *peer)
  */
 void wg_timers_any_authenticated_packet_sent(struct wg_peer *peer)
 {
-	del_timer(&peer->timer_send_keepalive);
+	timer_delete(&peer->timer_send_keepalive);
 }
 
 /* Should be called after any type of authenticated packet is received, whether
@@ -175,7 +175,7 @@ void wg_timers_any_authenticated_packet_sent(struct wg_peer *peer)
  */
 void wg_timers_any_authenticated_packet_received(struct wg_peer *peer)
 {
-	del_timer(&peer->timer_new_handshake);
+	timer_delete(&peer->timer_new_handshake);
 }
 
 /* Should be called after a handshake initiation message is sent. */
@@ -191,7 +191,7 @@ void wg_timers_handshake_initiated(struct wg_peer *peer)
  */
 void wg_timers_handshake_complete(struct wg_peer *peer)
 {
-	del_timer(&peer->timer_retransmit_handshake);
+	timer_delete(&peer->timer_retransmit_handshake);
 	peer->timer_handshake_attempts = 0;
 	peer->sent_lastminute_handshake = false;
 	ktime_get_real_ts64(&peer->walltime_last_handshake);
@@ -234,10 +234,10 @@ void wg_timers_init(struct wg_peer *peer)
 
 void wg_timers_stop(struct wg_peer *peer)
 {
-	del_timer_sync(&peer->timer_retransmit_handshake);
-	del_timer_sync(&peer->timer_send_keepalive);
-	del_timer_sync(&peer->timer_new_handshake);
-	del_timer_sync(&peer->timer_zero_key_material);
-	del_timer_sync(&peer->timer_persistent_keepalive);
+	timer_delete_sync(&peer->timer_retransmit_handshake);
+	timer_delete_sync(&peer->timer_send_keepalive);
+	timer_delete_sync(&peer->timer_new_handshake);
+	timer_delete_sync(&peer->timer_zero_key_material);
+	timer_delete_sync(&peer->timer_persistent_keepalive);
 	flush_work(&peer->clear_peer_work);
 }

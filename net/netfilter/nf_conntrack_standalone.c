@@ -22,9 +22,6 @@
 #include <net/netfilter/nf_conntrack_acct.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/nf_conntrack_timestamp.h>
-#ifdef CONFIG_LWTUNNEL
-#include <net/netfilter/nf_hooks_lwtunnel.h>
-#endif
 #include <linux/rculist_nulls.h>
 
 static bool enable_hooks __read_mostly;
@@ -175,17 +172,16 @@ static void ct_seq_stop(struct seq_file *s, void *v)
 #ifdef CONFIG_NF_CONNTRACK_SECMARK
 static void ct_show_secctx(struct seq_file *s, const struct nf_conn *ct)
 {
+	struct lsm_context ctx;
 	int ret;
-	u32 len;
-	char *secctx;
 
-	ret = security_secid_to_secctx(ct->secmark, &secctx, &len);
-	if (ret)
+	ret = security_secid_to_secctx(ct->secmark, &ctx);
+	if (ret < 0)
 		return;
 
-	seq_printf(s, "secctx=%s ", secctx);
+	seq_printf(s, "secctx=%s ", ctx.context);
 
-	security_release_secctx(secctx, len);
+	security_release_secctx(&ctx);
 }
 #else
 static inline void ct_show_secctx(struct seq_file *s, const struct nf_conn *ct)
@@ -275,7 +271,7 @@ static const char* l4proto_name(u16 proto)
 	return "unknown";
 }
 
-static unsigned int
+static void
 seq_print_acct(struct seq_file *s, const struct nf_conn *ct, int dir)
 {
 	struct nf_conn_acct *acct;
@@ -283,14 +279,12 @@ seq_print_acct(struct seq_file *s, const struct nf_conn *ct, int dir)
 
 	acct = nf_conn_acct_find(ct);
 	if (!acct)
-		return 0;
+		return;
 
 	counter = acct->counter;
 	seq_printf(s, "packets=%llu bytes=%llu ",
 		   (unsigned long long)atomic64_read(&counter[dir].packets),
 		   (unsigned long long)atomic64_read(&counter[dir].bytes));
-
-	return 0;
 }
 
 /* return 0 on success, 1 in case of error */
@@ -342,8 +336,7 @@ static int ct_seq_show(struct seq_file *s, void *v)
 	if (seq_has_overflowed(s))
 		goto release;
 
-	if (seq_print_acct(s, ct, IP_CT_DIR_ORIGINAL))
-		goto release;
+	seq_print_acct(s, ct, IP_CT_DIR_ORIGINAL);
 
 	if (!(test_bit(IPS_SEEN_REPLY_BIT, &ct->status)))
 		seq_puts(s, "[UNREPLIED] ");
@@ -352,8 +345,7 @@ static int ct_seq_show(struct seq_file *s, void *v)
 
 	ct_show_zone(s, ct, NF_CT_ZONE_DIR_REPL);
 
-	if (seq_print_acct(s, ct, IP_CT_DIR_REPLY))
-		goto release;
+	seq_print_acct(s, ct, IP_CT_DIR_REPLY);
 
 	if (test_bit(IPS_HW_OFFLOAD_BIT, &ct->status))
 		seq_puts(s, "[HW_OFFLOAD] ");
@@ -531,7 +523,7 @@ EXPORT_SYMBOL_GPL(nf_conntrack_count);
 static unsigned int nf_conntrack_htable_size_user __read_mostly;
 
 static int
-nf_conntrack_hash_sysctl(struct ctl_table *table, int write,
+nf_conntrack_hash_sysctl(const struct ctl_table *table, int write,
 			 void *buffer, size_t *lenp, loff_t *ppos)
 {
 	int ret;
@@ -616,14 +608,9 @@ enum nf_ct_sysctl_index {
 	NF_SYSCTL_CT_PROTO_TIMEOUT_GRE,
 	NF_SYSCTL_CT_PROTO_TIMEOUT_GRE_STREAM,
 #endif
-#ifdef CONFIG_LWTUNNEL
-	NF_SYSCTL_CT_LWTUNNEL,
-#endif
 
-	__NF_SYSCTL_CT_LAST_SYSCTL,
+	NF_SYSCTL_CT_LAST_SYSCTL,
 };
-
-#define NF_SYSCTL_CT_LAST_SYSCTL (__NF_SYSCTL_CT_LAST_SYSCTL + 1)
 
 static struct ctl_table nf_ct_sysctl_table[] = {
 	[NF_SYSCTL_CT_MAX] = {
@@ -631,7 +618,9 @@ static struct ctl_table nf_ct_sysctl_table[] = {
 		.data		= &nf_conntrack_max,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_INT_MAX,
 	},
 	[NF_SYSCTL_CT_COUNT] = {
 		.procname	= "nf_conntrack_count",
@@ -667,7 +656,9 @@ static struct ctl_table nf_ct_sysctl_table[] = {
 		.data		= &nf_ct_expect_max,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+		.extra2		= SYSCTL_INT_MAX,
 	},
 	[NF_SYSCTL_CT_ACCT] = {
 		.procname	= "nf_conntrack_acct",
@@ -952,16 +943,6 @@ static struct ctl_table nf_ct_sysctl_table[] = {
 		.proc_handler   = proc_dointvec_jiffies,
 	},
 #endif
-#ifdef CONFIG_LWTUNNEL
-	[NF_SYSCTL_CT_LWTUNNEL] = {
-		.procname	= "nf_hooks_lwtunnel",
-		.data		= NULL,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= nf_hooks_lwtunnel_sysctl_handler,
-	},
-#endif
-	{}
 };
 
 static struct ctl_table nf_ct_netfilter_table[] = {
@@ -970,9 +951,10 @@ static struct ctl_table nf_ct_netfilter_table[] = {
 		.data		= &nf_conntrack_max,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_INT_MAX,
 	},
-	{ }
 };
 
 static void nf_conntrack_standalone_init_tcp_sysctl(struct net *net,
@@ -1110,7 +1092,9 @@ static int nf_conntrack_standalone_init_sysctl(struct net *net)
 		table[NF_SYSCTL_CT_BUCKETS].mode = 0444;
 	}
 
-	cnet->sysctl_header = register_net_sysctl(net, "net/netfilter", table);
+	cnet->sysctl_header = register_net_sysctl_sz(net, "net/netfilter",
+						     table,
+						     ARRAY_SIZE(nf_ct_sysctl_table));
 	if (!cnet->sysctl_header)
 		goto out_unregister_netfilter;
 
@@ -1124,7 +1108,7 @@ out_unregister_netfilter:
 static void nf_conntrack_standalone_fini_sysctl(struct net *net)
 {
 	struct nf_conntrack_net *cnet = nf_ct_pernet(net);
-	struct ctl_table *table;
+	const struct ctl_table *table;
 
 	table = cnet->sysctl_header->ctl_table_arg;
 	unregister_net_sysctl_table(cnet->sysctl_header);
@@ -1222,11 +1206,12 @@ static int __init nf_conntrack_standalone_init(void)
 	nf_conntrack_htable_size_user = nf_conntrack_htable_size;
 #endif
 
+	nf_conntrack_init_end();
+
 	ret = register_pernet_subsys(&nf_conntrack_net_ops);
 	if (ret < 0)
 		goto out_pernet;
 
-	nf_conntrack_init_end();
 	return 0;
 
 out_pernet:

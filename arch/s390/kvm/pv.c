@@ -17,6 +17,21 @@
 #include <linux/sched/mm.h>
 #include <linux/mmu_notifier.h>
 #include "kvm-s390.h"
+#include "gmap.h"
+
+bool kvm_s390_pv_is_protected(struct kvm *kvm)
+{
+	lockdep_assert_held(&kvm->lock);
+	return !!kvm_s390_pv_get_handle(kvm);
+}
+EXPORT_SYMBOL_GPL(kvm_s390_pv_is_protected);
+
+bool kvm_s390_pv_cpu_is_protected(struct kvm_vcpu *vcpu)
+{
+	lockdep_assert_held(&vcpu->mutex);
+	return !!kvm_s390_pv_cpu_get_handle(vcpu);
+}
+EXPORT_SYMBOL_GPL(kvm_s390_pv_cpu_is_protected);
 
 /**
  * struct pv_vm_to_be_destroyed - Represents a protected VM that needs to
@@ -271,9 +286,10 @@ static int kvm_s390_pv_deinit_vm_fast(struct kvm *kvm, u16 *rc, u16 *rrc)
 	WRITE_ONCE(kvm->arch.gmap->guest_handle, 0);
 	KVM_UV_EVENT(kvm, 3, "PROTVIRT DESTROY VM FAST: rc %x rrc %x",
 		     uvcb.header.rc, uvcb.header.rrc);
-	WARN_ONCE(cc, "protvirt destroy vm fast failed handle %llx rc %x rrc %x",
+	WARN_ONCE(cc && uvcb.header.rc != 0x104,
+		  "protvirt destroy vm fast failed handle %llx rc %x rrc %x",
 		  kvm_s390_pv_get_handle(kvm), uvcb.header.rc, uvcb.header.rrc);
-	/* Inteded memory leak on "impossible" error */
+	/* Intended memory leak on "impossible" error */
 	if (!cc)
 		kvm_s390_pv_dealloc_vm(kvm);
 	return cc ? -EIO : 0;
@@ -314,6 +330,11 @@ int kvm_s390_pv_set_aside(struct kvm *kvm, u16 *rc, u16 *rrc)
 	 */
 	if (kvm->arch.pv.set_aside)
 		return -EINVAL;
+
+	/* Guest with segment type ASCE, refuse to destroy asynchronously */
+	if ((kvm->arch.gmap->asce & _ASCE_TYPE_MASK) == _ASCE_TYPE_SEGMENT)
+		return -EINVAL;
+
 	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
@@ -406,8 +427,12 @@ int kvm_s390_pv_deinit_cleanup_all(struct kvm *kvm, u16 *rc, u16 *rrc)
 	u16 _rc, _rrc;
 	int cc = 0;
 
-	/* Make sure the counter does not reach 0 before calling s390_uv_destroy_range */
-	atomic_inc(&kvm->mm->context.protected_count);
+	/*
+	 * Nothing to do if the counter was already 0. Otherwise make sure
+	 * the counter does not reach 0 before calling s390_uv_destroy_range.
+	 */
+	if (!atomic_inc_not_zero(&kvm->mm->context.protected_count))
+		return 0;
 
 	*rc = 1;
 	/* If the current VM is protected, destroy it */
@@ -552,12 +577,14 @@ int kvm_s390_pv_init_vm(struct kvm *kvm, u16 *rc, u16 *rrc)
 	uvcb.conf_base_stor_origin =
 		virt_to_phys((void *)kvm->arch.pv.stor_base);
 	uvcb.conf_virt_stor_origin = (u64)kvm->arch.pv.stor_var;
+	uvcb.flags.ap_allow_instr = kvm->arch.model.uv_feat_guest.ap;
+	uvcb.flags.ap_instr_intr = kvm->arch.model.uv_feat_guest.ap_intr;
 
 	cc = uv_call_sched(0, (u64)&uvcb);
 	*rc = uvcb.header.rc;
 	*rrc = uvcb.header.rrc;
-	KVM_UV_EVENT(kvm, 3, "PROTVIRT CREATE VM: handle %llx len %llx rc %x rrc %x",
-		     uvcb.guest_handle, uvcb.guest_stor_len, *rc, *rrc);
+	KVM_UV_EVENT(kvm, 3, "PROTVIRT CREATE VM: handle %llx len %llx rc %x rrc %x flags %04x",
+		     uvcb.guest_handle, uvcb.guest_stor_len, *rc, *rrc, uvcb.flags.raw);
 
 	/* Outputs */
 	kvm->arch.pv.handle = uvcb.guest_handle;
@@ -612,9 +639,27 @@ static int unpack_one(struct kvm *kvm, unsigned long addr, u64 tweak,
 		.tweak[1] = offset,
 	};
 	int ret = gmap_make_secure(kvm->arch.gmap, addr, &uvcb);
+	unsigned long vmaddr;
+	bool unlocked;
 
 	*rc = uvcb.header.rc;
 	*rrc = uvcb.header.rrc;
+
+	if (ret == -ENXIO) {
+		mmap_read_lock(kvm->mm);
+		vmaddr = gfn_to_hva(kvm, gpa_to_gfn(addr));
+		if (kvm_is_error_hva(vmaddr)) {
+			ret = -EFAULT;
+		} else {
+			ret = fixup_user_fault(kvm->mm, vmaddr, FAULT_FLAG_WRITE, &unlocked);
+			if (!ret)
+				ret = __gmap_link(kvm->arch.gmap, addr, vmaddr);
+		}
+		mmap_read_unlock(kvm->mm);
+		if (!ret)
+			return -EAGAIN;
+		return ret;
+	}
 
 	if (ret && ret != -EAGAIN)
 		KVM_UV_EVENT(kvm, 3, "PROTVIRT VM UNPACK: failed addr %llx with rc %x rrc %x",
@@ -633,6 +678,8 @@ int kvm_s390_pv_unpack(struct kvm *kvm, unsigned long addr, unsigned long size,
 
 	KVM_UV_EVENT(kvm, 3, "PROTVIRT VM UNPACK: start addr %lx size %lx",
 		     addr, size);
+
+	guard(srcu)(&kvm->srcu);
 
 	while (offset < size) {
 		ret = unpack_one(kvm, addr, tweak, offset, rc, rrc);

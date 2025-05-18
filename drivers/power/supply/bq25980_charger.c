@@ -932,7 +932,7 @@ static const struct regmap_config bq25980_regmap_config = {
 	.max_register = BQ25980_CHRGR_CTRL_6,
 	.reg_defaults	= bq25980_reg_defs,
 	.num_reg_defaults = ARRAY_SIZE(bq25980_reg_defs),
-	.cache_type = REGCACHE_RBTREE,
+	.cache_type = REGCACHE_MAPLE,
 	.volatile_reg = bq25980_is_volatile_reg,
 };
 
@@ -943,7 +943,7 @@ static const struct regmap_config bq25975_regmap_config = {
 	.max_register = BQ25980_CHRGR_CTRL_6,
 	.reg_defaults	= bq25975_reg_defs,
 	.num_reg_defaults = ARRAY_SIZE(bq25975_reg_defs),
-	.cache_type = REGCACHE_RBTREE,
+	.cache_type = REGCACHE_MAPLE,
 	.volatile_reg = bq25980_is_volatile_reg,
 };
 
@@ -954,7 +954,7 @@ static const struct regmap_config bq25960_regmap_config = {
 	.max_register = BQ25980_CHRGR_CTRL_6,
 	.reg_defaults	= bq25960_reg_defs,
 	.num_reg_defaults = ARRAY_SIZE(bq25960_reg_defs),
-	.cache_type = REGCACHE_RBTREE,
+	.cache_type = REGCACHE_MAPLE,
 	.volatile_reg = bq25980_is_volatile_reg,
 };
 
@@ -1057,7 +1057,7 @@ static int bq25980_power_supply_init(struct bq25980_device *bq,
 							struct device *dev)
 {
 	struct power_supply_config psy_cfg = { .drv_data = bq,
-						.of_node = dev->of_node, };
+						.fwnode = dev_fwnode(dev), };
 
 	psy_cfg.supplied_to = bq25980_charger_supplied_to;
 	psy_cfg.num_supplicants = ARRAY_SIZE(bq25980_charger_supplied_to);
@@ -1223,7 +1223,7 @@ static int bq25980_probe(struct i2c_client *client)
 
 	mutex_init(&bq->lock);
 
-	strncpy(bq->model_name, id->name, I2C_NAME_SIZE);
+	strscpy(bq->model_name, id->name, sizeof(bq->model_name));
 	bq->chip_info = &bq25980_chip_info_tbl[id->driver_data];
 
 	bq->regmap = devm_regmap_init_i2c(client,
@@ -1287,7 +1287,7 @@ static struct i2c_driver bq25980_driver = {
 		.name = "bq25980-charger",
 		.of_match_table = bq25980_of_match,
 	},
-	.probe_new = bq25980_probe,
+	.probe = bq25980_probe,
 	.id_table = bq25980_i2c_ids,
 };
 module_i2c_driver(bq25980_driver);

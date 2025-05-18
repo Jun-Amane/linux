@@ -350,7 +350,7 @@ static const struct dev_pm_ops fsa9480_pm_ops = {
 };
 
 static const struct i2c_device_id fsa9480_id[] = {
-	{ "fsa9480", 0 },
+	{ "fsa9480" },
 	{}
 };
 MODULE_DEVICE_TABLE(i2c, fsa9480_id);
@@ -369,7 +369,7 @@ static struct i2c_driver fsa9480_i2c_driver = {
 		.pm		= &fsa9480_pm_ops,
 		.of_match_table = fsa9480_of_match,
 	},
-	.probe_new		= fsa9480_probe,
+	.probe			= fsa9480_probe,
 	.id_table		= fsa9480_id,
 };
 

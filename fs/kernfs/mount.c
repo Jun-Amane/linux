@@ -16,11 +16,14 @@
 #include <linux/namei.h>
 #include <linux/seq_file.h>
 #include <linux/exportfs.h>
+#include <linux/uuid.h>
+#include <linux/statfs.h>
 
 #include "kernfs-internal.h"
 
-struct kmem_cache *kernfs_node_cache, *kernfs_iattrs_cache;
-struct kernfs_global_locks *kernfs_locks;
+struct kmem_cache *kernfs_node_cache __ro_after_init;
+struct kmem_cache *kernfs_iattrs_cache __ro_after_init;
+struct kernfs_global_locks *kernfs_locks __ro_after_init;
 
 static int kernfs_sop_show_options(struct seq_file *sf, struct dentry *dentry)
 {
@@ -45,8 +48,15 @@ static int kernfs_sop_show_path(struct seq_file *sf, struct dentry *dentry)
 	return 0;
 }
 
+static int kernfs_statfs(struct dentry *dentry, struct kstatfs *buf)
+{
+	simple_statfs(dentry, buf);
+	buf->f_fsid = uuid_to_fsid(dentry->d_sb->s_uuid.b);
+	return 0;
+}
+
 const struct super_operations kernfs_sops = {
-	.statfs		= simple_statfs,
+	.statfs		= kernfs_statfs,
 	.drop_inode	= generic_delete_inode,
 	.evict_inode	= kernfs_evict_inode,
 
@@ -115,9 +125,6 @@ static struct dentry *__kernfs_fh_to_dentry(struct super_block *sb,
 
 	inode = kernfs_get_inode(sb, kn);
 	kernfs_put(kn);
-	if (!inode)
-		return ERR_PTR(-ESTALE);
-
 	return d_obtain_alias(inode);
 }
 
@@ -138,8 +145,10 @@ static struct dentry *kernfs_fh_to_parent(struct super_block *sb,
 static struct dentry *kernfs_get_parent_dentry(struct dentry *child)
 {
 	struct kernfs_node *kn = kernfs_dentry_node(child);
+	struct kernfs_root *root = kernfs_root(kn);
 
-	return d_obtain_alias(kernfs_get_inode(child->d_sb, kn->parent));
+	guard(rwsem_read)(&root->kernfs_rwsem);
+	return d_obtain_alias(kernfs_get_inode(child->d_sb, kernfs_parent(kn)));
 }
 
 static const struct export_operations kernfs_export_ops = {
@@ -179,10 +188,10 @@ static struct kernfs_node *find_next_ancestor(struct kernfs_node *child,
 		return NULL;
 	}
 
-	while (child->parent != parent) {
-		if (!child->parent)
+	while (kernfs_parent(child) != parent) {
+		child = kernfs_parent(child);
+		if (!child)
 			return NULL;
-		child = child->parent;
 	}
 
 	return child;
@@ -199,17 +208,28 @@ struct dentry *kernfs_node_dentry(struct kernfs_node *kn,
 				  struct super_block *sb)
 {
 	struct dentry *dentry;
-	struct kernfs_node *knparent = NULL;
+	struct kernfs_node *knparent;
+	struct kernfs_root *root;
 
 	BUG_ON(sb->s_op != &kernfs_sops);
 
 	dentry = dget(sb->s_root);
 
 	/* Check if this is the root kernfs_node */
-	if (!kn->parent)
+	if (!rcu_access_pointer(kn->__parent))
 		return dentry;
 
-	knparent = find_next_ancestor(kn, NULL);
+	root = kernfs_root(kn);
+	/*
+	 * As long as kn is valid, its parent can not vanish. This is cgroup's
+	 * kn so it can't have its parent replaced. Therefore it is safe to use
+	 * the ancestor node outside of the RCU or locked section.
+	 */
+	if (WARN_ON_ONCE(!(root->flags & KERNFS_ROOT_INVARIANT_PARENT)))
+		return ERR_PTR(-EINVAL);
+	scoped_guard(rcu) {
+		knparent = find_next_ancestor(kn, NULL);
+	}
 	if (WARN_ON(!knparent)) {
 		dput(dentry);
 		return ERR_PTR(-EINVAL);
@@ -218,17 +238,26 @@ struct dentry *kernfs_node_dentry(struct kernfs_node *kn,
 	do {
 		struct dentry *dtmp;
 		struct kernfs_node *kntmp;
+		const char *name;
 
 		if (kn == knparent)
 			return dentry;
-		kntmp = find_next_ancestor(kn, knparent);
-		if (WARN_ON(!kntmp)) {
-			dput(dentry);
-			return ERR_PTR(-EINVAL);
+
+		scoped_guard(rwsem_read, &root->kernfs_rwsem) {
+			kntmp = find_next_ancestor(kn, knparent);
+			if (WARN_ON(!kntmp)) {
+				dput(dentry);
+				return ERR_PTR(-EINVAL);
+			}
+			name = kstrdup(kernfs_rcu_name(kntmp), GFP_KERNEL);
 		}
-		dtmp = lookup_positive_unlocked(kntmp->name, dentry,
-					       strlen(kntmp->name));
+		if (!name) {
+			dput(dentry);
+			return ERR_PTR(-ENOMEM);
+		}
+		dtmp = lookup_positive_unlocked(name, dentry, strlen(name));
 		dput(dentry);
+		kfree(name);
 		if (IS_ERR(dtmp))
 			return dtmp;
 		knparent = kntmp;
@@ -256,7 +285,7 @@ static int kernfs_fill_super(struct super_block *sb, struct kernfs_fs_context *k
 	sb->s_time_gran = 1;
 
 	/* sysfs dentries and inodes don't require IO to create */
-	sb->s_shrink.seeks = 0;
+	sb->s_shrink->seeks = 0;
 
 	/* get root inode, initialize and unlock it */
 	down_read(&kf_root->kernfs_rwsem);
@@ -351,9 +380,13 @@ int kernfs_get_tree(struct fs_context *fc)
 		}
 		sb->s_flags |= SB_ACTIVE;
 
-		down_write(&root->kernfs_rwsem);
+		uuid_t uuid;
+		uuid_gen(&uuid);
+		super_set_uuid(sb, uuid.b, sizeof(uuid));
+
+		down_write(&root->kernfs_supers_rwsem);
 		list_add(&info->node, &info->root->supers);
-		up_write(&root->kernfs_rwsem);
+		up_write(&root->kernfs_supers_rwsem);
 	}
 
 	fc->root = dget(sb->s_root);
@@ -380,9 +413,9 @@ void kernfs_kill_sb(struct super_block *sb)
 	struct kernfs_super_info *info = kernfs_info(sb);
 	struct kernfs_root *root = info->root;
 
-	down_write(&root->kernfs_rwsem);
+	down_write(&root->kernfs_supers_rwsem);
 	list_del(&info->node);
-	up_write(&root->kernfs_rwsem);
+	up_write(&root->kernfs_supers_rwsem);
 
 	/*
 	 * Remove the superblock from fs_supers/s_instances
